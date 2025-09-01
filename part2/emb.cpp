@@ -9,10 +9,11 @@
 using namespace std;
 using namespace std::chrono;
 
-const int embedding_table_size = 1000000;
-const int embedding_dim = 128;
+const int embedding_table_size = 2000000;
+const int embedding_dim = 64;
 const int input_size = 720;
 const int num_bags = 20;
+const int prefetch = 16;
 
 
 int random_int(int range) {
@@ -23,39 +24,47 @@ int random_int(int range) {
 }
 
 long long run_with_prefetching(const vector<float>& embedding_table, const vector<int>& input, const vector<int>& offsets) {
+
     auto start = high_resolution_clock::now();
     
+    //----------------------------------------------------- Write your code here ----------------------------------------------------------------
+    
     vector<vector<float>> output;
-    long long pf_count = 0;   // reset per run
-    const int PREFETCH_DISTANCE = 1;
 
     for (size_t i = 0; i < offsets.size(); ++i) {
-        int start_idx = offsets[i];
-        int end_idx = (i + 1 < offsets.size()) ? offsets[i + 1] : input.size();
+            int start_idx = offsets[i];
+            int end_idx = (i + 1 < offsets.size()) ? offsets[i + 1] : input.size();
 
-        vector<float> bag_embedding(embedding_dim, 0.0f);
+            vector<float> bag_embedding(embedding_dim, 0.0f);
 
-        for (int j = start_idx; j < end_idx; ++j) {
-            int idx = input[j];
-            float* data_ptr = (float*)&embedding_table[idx * embedding_dim];
-
-            if (j+PREFETCH_DISTANCE < end_idx) {
-                int idx_pref = input[j + PREFETCH_DISTANCE];
-                // _mm_prefetch((const char*)&embedding_table[idx_pref * embedding_dim], _MM_HINT_T0);
-                __builtin_prefetch((const void*)&embedding_table[idx_pref * embedding_dim], 0, 0);
-                pf_count++;
+            for (int j = start_idx; j < end_idx; ++j) {
+                float* data_ptr = (float*)&embedding_table[input[j] * embedding_dim];
+                if (j+3 < end_idx) {
+                    int idx_pref = input[j + 3];
+                    // _mm_prefetch((const char*)&embedding_table[idx_pref * embedding_dim], _MM_HINT_T0);
+                    // _mm_prefetch((const char*)&embedding_table[input[j+2] * embedding_dim], _MM_HINT_T0);
+                    // _mm_prefetch((const char*)&embedding_table[input[j+3] * embedding_dim], _MM_HINT_T0);
+                    // _mm_prefetch((const char*)&embedding_table[input[j+4] * embedding_dim], _MM_HINT_T0);
+                    // _mm_prefetch((const char*)&embedding_table[input[j+5] * embedding_dim], _MM_HINT_T0);
+                    // _mm_prefetch((const char*)&embedding_table[input[j+6] * embedding_dim], _MM_HINT_T0);
+                    
+                    __builtin_prefetch((const void*)&embedding_table[idx_pref * embedding_dim], 0, 0);
+                }
+                for (int d = 0; d < embedding_dim; ++d) {
+                    // if (d%16 == 0 and d+16 < embedding_dim) {
+                    //     _mm_prefetch(&data_ptr[d+16], _MM_HINT_T0);
+                    // }
+                    bag_embedding[d] += data_ptr[d];
+                }
             }
-            for (int d = 0; d < embedding_dim; ++d) {
-                bag_embedding[d] += data_ptr[d];
-            }
+            output.push_back(bag_embedding);
         }
-        output.push_back(bag_embedding);
-    }
-
+    //-------------------------------------------------------------------------------------------------------------------------------------------
+    
     auto end = high_resolution_clock::now();
     auto duration = duration_cast<microseconds>(end - start);
     cout << "\nTime WITH software prefetching: " << duration.count() << " microseconds.";
-    cout << "\n" << pf_count << " prefetches issued.";
+
     return duration.count();
 }
 
@@ -74,11 +83,11 @@ long long run_with_simd(const vector<float>& embedding_table, const vector<int>&
             const float* data_ptr = &embedding_table[(input[j]) * embedding_dim ];
 
             int d = 0;
-            for (; d + 4 <= embedding_dim; d += 4) {
-                __m128 acc = _mm_loadu_ps(&bag_embedding[d]);
-                __m128 val = _mm_loadu_ps(&data_ptr[d]);
-                acc = _mm_add_ps(acc, val);
-                _mm_storeu_ps(&bag_embedding[d], acc);
+            for (; d + 16 <= embedding_dim; d += 16) {
+                __m512 acc = _mm512_loadu_ps(&bag_embedding[d]);
+                __m512 val = _mm512_loadu_ps(&data_ptr[d]);
+                acc = _mm512_add_ps(acc, val);
+                _mm512_storeu_ps(&bag_embedding[d], acc);
             }
         }
         output.push_back(bag_embedding);
@@ -91,50 +100,48 @@ long long run_with_simd(const vector<float>& embedding_table, const vector<int>&
 }
 
 long long run_with_prefetching_simd(const vector<float>& embedding_table, const vector<int>& input, const vector<int>& offsets) {
-    auto start = high_resolution_clock::now();
+        auto start = high_resolution_clock::now();
+    
+    //----------------------------------------------------- Write your code here ----------------------------------------------------------------
+    
+        vector<vector<float>> output;
 
-    const int PREFETCH_DISTANCE = 1;
-    const int PREFETCH_LOCALITY = 0;
+        for (size_t i = 0; i < offsets.size(); ++i) {
+                int start_idx = offsets[i];
+                int end_idx = (i + 1 < offsets.size()) ? offsets[i + 1] : input.size();
 
-    vector<vector<float>> output;
+                vector<float> bag_embedding(embedding_dim, 0.0f);
 
-    for (size_t b = 0; b < offsets.size(); ++b) {
-        int start_idx = offsets[b];
-        int end_idx = (b + 1 < offsets.size()) ? offsets[b + 1] : (input.size());
-
-        vector<float> bag_embedding(embedding_dim, 0.0f);
-
-        for (int j = start_idx; j < end_idx; ++j) {
-            // ---------------- Prefetch ----------------
-            int j_pref = j + PREFETCH_DISTANCE;
-            if (j_pref < end_idx) {
-                int idx_pref = input[j_pref];
-                const float* addr_pref = &embedding_table[(idx_pref) * embedding_dim ];
-                __builtin_prefetch(reinterpret_cast<const void*>(addr_pref), 0, PREFETCH_LOCALITY);
+                for (int j = start_idx; j < end_idx; ++j) {
+                    float* data_ptr = (float*)&embedding_table[input[j] * embedding_dim];
+                    if (j+3 < end_idx) {
+                        int idx_pref = input[j + 3];
+                        _mm_prefetch((const char*)&embedding_table[idx_pref * embedding_dim], _MM_HINT_T0);
+                        // _mm_prefetch((const char*)&embedding_table[input[j+2] * embedding_dim], _MM_HINT_T0);
+                        // _mm_prefetch((const char*)&embedding_table[input[j+3] * embedding_dim], _MM_HINT_T0);
+                        // _mm_prefetch((const char*)&embedding_table[input[j+4] * embedding_dim], _MM_HINT_T0);
+                        // _mm_prefetch((const char*)&embedding_table[input[j+5] * embedding_dim], _MM_HINT_T0);
+                        // _mm_prefetch((const char*)&embedding_table[input[j+6] * embedding_dim], _MM_HINT_T0);
+                        
+                        // __builtin_prefetch((const void*)&embedding_table[idx_pref * embedding_dim], 0, 0);
+                    }
+                    int d = 0;
+                    for (; d + 16 <= embedding_dim; d += 16) {
+                        __m512 acc = _mm512_loadu_ps(&bag_embedding[d]);
+                        __m512 val = _mm512_loadu_ps(&data_ptr[d]);
+                        acc = _mm512_add_ps(acc, val);
+                        _mm512_storeu_ps(&bag_embedding[d], acc);
+                    }
+                }
+                output.push_back(bag_embedding);
             }
-            // ------------------------------------------
+        //-------------------------------------------------------------------------------------------------------------------------------------------
+        
+        auto end = high_resolution_clock::now();
+        auto duration = duration_cast<microseconds>(end - start);
+        cout << "\nTime WITH software prefetching: " << duration.count() << " microseconds.";
 
-            const float* data_ptr = &embedding_table[(input[j]) * embedding_dim ];
-
-            int d = 0;
-            for (; d + 4 <= embedding_dim; d += 4) {
-                __m128 acc = _mm_loadu_ps(&bag_embedding[d]);
-                __m128 val = _mm_loadu_ps(&data_ptr[d]);
-                acc = _mm_add_ps(acc, val);
-                _mm_storeu_ps(&bag_embedding[d], acc);
-            }
-            for (; d < embedding_dim; ++d) {
-                bag_embedding[d] += data_ptr[d];
-            }
-        }
-
-        output.push_back(bag_embedding);
-    }
-
-    auto end = high_resolution_clock::now();
-    auto duration = duration_cast<microseconds>(end - start);
-    cout << "\nTime WITH software prefetching and SIMD: " << duration.count() << " microseconds.";
-    return duration.count();
+        return duration.count();
 }
 
 long long naive_emb(vector<float>& embedding_table, const vector<int>& input, const vector<int>& offsets) {

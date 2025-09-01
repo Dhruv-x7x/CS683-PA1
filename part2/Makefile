@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -O0 -Wall -g
+CXXFLAGS = -O0 -mavx2 -msse -mavx512f -Wall -g
 # -mavx2 -msse -mavx512f use these commands for simd
 TARGET = emb
 SRCS = emb.cpp
